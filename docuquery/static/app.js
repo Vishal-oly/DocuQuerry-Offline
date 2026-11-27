@@ -1,0 +1,880 @@
+(() => {
+  const $ = (selector) => document.querySelector(selector);
+  const pdfInput = $('#pdfInput');
+  const dropZone = $('#dropZone');
+  const browseButton = $('#browseButton');
+  const uploadProgress = $('#uploadProgress');
+  const uploadProgressBar = $('#uploadProgressBar');
+  const uploadProgressLabel = $('#uploadProgressLabel');
+  const pageAlert = $('#pageAlert');
+  const emptyState = $('#emptyState');
+  const resultsPanel = $('#resultsPanel');
+  const chatInput = $('#chatInput');
+  const sendButton = $('#sendButton');
+  const chatForm = $('#chatForm');
+  const chatMessages = $('#chatMessages');
+  const assistantWelcome = $('#assistantWelcome');
+  const sectionLinks = [...document.querySelectorAll('.section-link')];
+  const paperOnlyLinks = document.querySelectorAll('.section-link.requires-paper');
+  const summaryFields = [
+    ['overall_summary', 'Overview', '✦', true],
+    ['objective', 'Research objective', '◎'],
+    ['methodology', 'Methodology', '⌘'],
+    ['dataset', 'Data & materials', '▤'],
+    ['key_findings', 'Key findings', '↗'],
+    ['limitations', 'Limitations', '△'],
+    ['conclusion', 'Conclusion', '◌'],
+  ];
+  let activePaper = null;
+  let maxUploadMb = 20;
+  let toastTimer = null;
+  let uploadTimer = null;
+  let uploadInProgress = false;
+  let chatEpoch = 0;
+
+  function setActiveSection(sectionName) {
+    sectionLinks.forEach((link) => {
+      const active = link.dataset.section === sectionName;
+      link.classList.toggle('active', active);
+      if (active) link.setAttribute('aria-current', 'location');
+      else link.removeAttribute('aria-current');
+    });
+  }
+
+  function setPaperSectionsEnabled(enabled) {
+    paperOnlyLinks.forEach((link) => {
+      link.setAttribute('aria-disabled', String(!enabled));
+    });
+  }
+
+  function setAlert(message, kind = 'error') {
+    pageAlert.textContent = message;
+    pageAlert.classList.toggle('success', kind === 'success');
+    pageAlert.hidden = !message;
+  }
+
+  function showToast(message) {
+    const toast = $('#toast');
+    toast.textContent = message;
+    toast.hidden = false;
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(() => { toast.hidden = true; }, 3600);
+  }
+
+  async function api(url, options = {}) {
+    const fetchFn = window.DQAuth ? window.DQAuth.apiFetch : fetch;
+    const response = await fetchFn(url, options);
+    let payload;
+    try { payload = await response.json(); }
+    catch { payload = {}; }
+    if (response.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/register')) {
+      if (window.DQAuth) window.DQAuth.clearToken();
+      window.location.href = '/login';
+      throw new Error(payload.error || 'Please sign in to continue.');
+    }
+    if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
+    return payload;
+  }
+
+  function textElement(tag, className, text) {
+    const element = document.createElement(tag);
+    if (className) element.className = className;
+    element.textContent = text || '';
+    return element;
+  }
+
+  function renderSummary(summary = {}) {
+    const grid = $('#summaryGrid');
+    grid.replaceChildren();
+    summaryFields.forEach(([field, label, icon, wide]) => {
+      const card = document.createElement('article');
+      card.className = `summary-card${wide ? ' summary-card-wide' : ''}`;
+      card.dataset.field = field;
+      const header = document.createElement('div');
+      header.className = 'summary-card-top';
+      header.append(textElement('span', 'summary-card-icon', icon));
+      header.append(textElement('span', 'summary-card-title', label));
+      const body = textElement('p', '', summary[field] || 'Not clearly stated in the retrieved text.');
+      card.append(header, body);
+      grid.append(card);
+    });
+
+    $('#summaryMode').textContent = summary.mode || 'Research brief';
+    const notice = $('#summaryNotice');
+    notice.textContent = summary.notice || '';
+    notice.hidden = !summary.notice;
+    renderSources(summary.sources || [], '#summarySources', '#sourcesCount');
+  }
+
+  function renderSources(sources, targetSelector, countSelector) {
+    const list = $(targetSelector);
+    list.replaceChildren();
+    if (countSelector) $(countSelector).textContent = `${sources.length} passage${sources.length === 1 ? '' : 's'}`;
+    if (!sources.length) {
+      list.append(textElement('div', 'no-sources', 'No source passages were attached to this response.'));
+      return;
+    }
+    sources.forEach((source) => {
+      const item = document.createElement('article');
+      item.className = 'source-item';
+      const head = document.createElement('div');
+      head.className = 'source-item-head';
+      head.append(textElement('span', 'source-page', `PAGE ${source.page_number || 1}`));
+      head.append(textElement('span', 'source-section', source.section || 'Paper excerpt'));
+      item.append(head, textElement('p', '', source.excerpt || ''));
+      list.append(item);
+    });
+  }
+
+  function updateChatContext(paper) {
+    const context = $('#chatContext');
+    context.replaceChildren();
+    context.append(textElement('span', 'context-icon', '⌕'));
+    const title = paper ? (paper.title || paper.filename) : 'Upload a paper to start asking';
+    context.append(textElement('span', '', title));
+  }
+
+  let chatLog = [];
+  let restoringChat = false;
+
+  function chatStorageKey() {
+    return activePaper ? `dqChat:${activePaper.id}` : '';
+  }
+
+  function persistChat() {
+    if (restoringChat) return;
+    const key = chatStorageKey();
+    if (!key) return;
+    try {
+      localStorage.setItem(key, JSON.stringify(chatLog.slice(-40)));
+    } catch (error) { /* storage may be full or blocked */ }
+  }
+
+  function restoreChat(paper) {
+    chatLog = [];
+    chatMessages.replaceChildren();
+    if (assistantWelcome) chatMessages.append(assistantWelcome);
+    if (!paper) return;
+    let saved = null;
+    try {
+      saved = JSON.parse(localStorage.getItem(`dqChat:${paper.id}`) || 'null');
+    } catch (error) { saved = null; }
+    if (!Array.isArray(saved) || !saved.length) return;
+    restoringChat = true;
+    saved.forEach((entry) => {
+      chatLog.push(entry);
+      addMessage(entry.role, entry.text, entry.sources || [], entry.mode || '');
+    });
+    restoringChat = false;
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
+  function addMessage(role, text, sources = [], mode = '') {
+    if (assistantWelcome && assistantWelcome.isConnected) assistantWelcome.remove();
+    const message = document.createElement('div');
+    message.className = `chat-message ${role}`;
+    message.append(textElement('div', 'chat-bubble', text));
+    if (role === 'assistant' && sources.length) {
+      const sourceRow = document.createElement('div');
+      sourceRow.className = 'chat-message-meta';
+      sourceRow.append(textElement('span', 'meta-label', 'Evidence:'));
+      const pages = [...new Set(sources.map((source) => source.page_number || 1))].slice(0, 4);
+      const token = window.DQAuth ? window.DQAuth.getToken() : '';
+      pages.forEach((page) => {
+        if (activePaper && token) {
+          const link = document.createElement('a');
+          link.className = 'chat-source-mini';
+          link.href = `/api/papers/${encodeURIComponent(activePaper.id)}/file?token=${encodeURIComponent(token)}#page=${page}`;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          link.title = `Open page ${page} in the PDF`;
+          link.textContent = `p. ${page}`;
+          sourceRow.append(link);
+        } else {
+          sourceRow.append(textElement('span', 'chat-source-mini', `p. ${page}`));
+        }
+      });
+      message.append(sourceRow);
+    }
+    if (role === 'assistant' && mode) {
+      // Always show how the answer was produced: sources must never hide the mode label.
+      message.append(textElement('div', 'chat-message-mode', mode));
+    }
+    chatMessages.append(message);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    if (!restoringChat) {
+      chatLog.push({ role, text, sources, mode });
+      persistChat();
+    }
+    return message;
+  }
+
+  function setPaper(paper, chunkCount = null) {
+    activePaper = paper;
+    setAlert('');
+    setPaperSectionsEnabled(true);
+    setActiveSection('brief');
+    emptyState.hidden = true;
+    resultsPanel.hidden = false;
+    $('#paperTitle').textContent = paper.title || 'Untitled paper';
+    $('#paperFilename').textContent = paper.filename || 'paper.pdf';
+    $('#paperPageCount').textContent = paper.page_count || '—';
+    $('#paperChunkCount').textContent = chunkCount || '—';
+    renderSummary(paper.summary || {});
+    updateChatContext(paper);
+    restoreChat(paper);
+    loadSuggestions(paper);
+    chatInput.disabled = false;
+    sendButton.disabled = false;
+    document.querySelectorAll('.suggestion-chip[data-question]').forEach((button) => { button.disabled = false; });
+    loadLibrary();
+  }
+
+  function renderLibrary(papers) {
+    const library = $('#libraryList');
+    library.replaceChildren();
+    $('#libraryCount').textContent = String(papers.length);
+    if (!papers.length) {
+      library.append(textElement('div', 'library-empty', 'Papers you upload will appear here.'));
+      return;
+    }
+    papers.forEach((paper) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = `library-item${activePaper && activePaper.id === paper.id ? ' active' : ''}`;
+      item.setAttribute('aria-label', `Open ${paper.title || paper.filename}`);
+      item.append(textElement('span', 'library-pdf', 'PDF'));
+      const copy = document.createElement('span');
+      copy.className = 'library-item-copy';
+      copy.append(textElement('span', 'library-item-title', paper.title || paper.filename));
+      copy.append(textElement('span', 'library-item-meta', `${paper.page_count || 0} pages · ${paper.filename || 'paper.pdf'}`));
+      item.append(copy);
+      if (activePaper && activePaper.id === paper.id) item.append(textElement('span', 'library-item-check', '✓'));
+      item.addEventListener('click', () => selectPaper(paper.id));
+      library.append(item);
+    });
+  }
+
+  async function loadLibrary() {
+    try {
+      const payload = await api('/api/papers');
+      renderLibrary(payload.papers || []);
+    } catch (error) {
+      console.warn('Could not load paper library:', error.message);
+    }
+  }
+
+  async function selectPaper(paperId) {
+    try {
+      const payload = await api(`/api/papers/${encodeURIComponent(paperId)}`);
+      chatMessages.replaceChildren();
+      if (assistantWelcome) chatMessages.append(assistantWelcome);
+      activePaper = null;
+      setPaper(payload.paper);
+      resultsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  function setUploading(isUploading) {
+    uploadInProgress = isUploading;
+    browseButton.disabled = isUploading;
+    uploadProgress.hidden = !isUploading;
+    if (isUploading) {
+      uploadProgressBar.style.width = '10%';
+      uploadProgressLabel.textContent = 'Reading pages and indexing passages…';
+      const startedAt = Date.now();
+      let progress = 10;
+      window.clearInterval(uploadTimer);
+      uploadTimer = window.setInterval(() => {
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        // Creep towards 92% without ever freezing, so long PDFs still show movement.
+        progress += Math.max(0.4, (92 - progress) * 0.07);
+        progress = Math.min(progress, 92);
+        uploadProgressBar.style.width = `${progress}%`;
+        if (elapsed < 10) {
+          uploadProgressLabel.textContent = 'Reading pages and indexing passages…';
+        } else if (elapsed < 30) {
+          uploadProgressLabel.textContent = 'Still indexing — larger PDFs take a minute or two…';
+        } else {
+          uploadProgressLabel.textContent = `Still indexing… ${elapsed}s elapsed, hang on.`;
+        }
+      }, 400);
+    } else {
+      window.clearInterval(uploadTimer);
+      uploadProgressBar.style.width = '100%';
+      window.setTimeout(() => { uploadProgressBar.style.width = '8%'; }, 450);
+    }
+  }
+
+  async function uploadFile(file) {
+    if (!file || uploadInProgress) return;
+    setAlert('');
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      setAlert('Please select a PDF file.');
+      return;
+    }
+    if (file.size > maxUploadMb * 1024 * 1024) {
+      setAlert(`This PDF is larger than ${maxUploadMb} MB. Choose a smaller file.`);
+      return;
+    }
+    const formData = new FormData();
+    formData.append('pdf', file);
+    setUploading(true);
+    try {
+      const payload = await api('/api/upload', { method: 'POST', body: formData, timeoutMs: 300000 });
+      chatMessages.replaceChildren();
+      setPaper(payload.paper, payload.chunk_count);
+      const mode = payload.summary && payload.summary.mode ? payload.summary.mode : 'processed';
+      const extras = [];
+      if (payload.table_chunks) extras.push(`${payload.table_chunks} table${payload.table_chunks === 1 ? '' : 's'}`);
+      if (payload.ocr_pages) extras.push(`${payload.ocr_pages} OCR page${payload.ocr_pages === 1 ? '' : 's'}`);
+      const extraText = extras.length ? ` · ${extras.join(' · ')}` : '';
+      setAlert(`Ready: ${payload.paper.title} · ${payload.chunk_count} passages indexed${extraText} · ${mode}.`, 'success');
+      $('#footerStatus').textContent = `${payload.chunk_count} passages indexed`;
+      showToast('Research brief is ready.');
+      resultsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (error) {
+      setAlert(error.message);
+    } finally {
+      setUploading(false);
+      pdfInput.value = '';
+    }
+  }
+
+  function answerDetail() {
+    const select = $('#answerDetail');
+    const value = select ? select.value : 'balanced';
+    try { localStorage.setItem('dqAnswerDetail', value); } catch (error) { /* storage may be blocked */ }
+    return value;
+  }
+
+  function restoreAnswerDetail() {
+    const select = $('#answerDetail');
+    if (!select) return;
+    try {
+      const saved = localStorage.getItem('dqAnswerDetail');
+      if (saved && select.querySelector(`option[value="${saved}"]`)) select.value = saved;
+    } catch (error) { /* ignore */ }
+  }
+
+  function showTyping() {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'chat-message assistant';
+    wrapper.id = 'typingIndicator';
+    const dots = document.createElement('div');
+    dots.className = 'chat-bubble typing-dots';
+    for (let i = 0; i < 3; i += 1) dots.append(document.createElement('span'));
+    wrapper.append(dots);
+    chatMessages.append(wrapper);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
+  /* ---- "Try asking": paper-specific questions generated by the local model ---- */
+  const SUGGESTION_VISIBLE = 4;
+  const suggestionState = { paperId: null, questions: [], loading: false, expanded: false, token: 0 };
+
+  function normaliseQuestion(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function renderSuggestions() {
+    const list = $('#suggestionList');
+    const actions = $('#suggestionActions');
+    if (!list) return;
+    list.replaceChildren();
+
+    if (!activePaper) {
+      list.append(textElement('div', 'suggestion-empty', 'Upload a paper and we will suggest questions from it.'));
+      if (actions) actions.hidden = true;
+      return;
+    }
+    if (suggestionState.loading) {
+      const loading = textElement('div', 'suggestion-empty suggestion-loading', 'Reading this paper to pick useful questions…');
+      list.append(loading);
+      if (actions) actions.hidden = true;
+      return;
+    }
+    const questions = suggestionState.questions;
+    if (!questions.length) {
+      list.append(textElement('div', 'suggestion-empty', 'That is every suggestion for this paper — ask your own question below.'));
+      if (actions) actions.hidden = false;
+      return;
+    }
+    const visible = suggestionState.expanded ? questions : questions.slice(0, SUGGESTION_VISIBLE);
+    visible.forEach((question) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'suggestion-chip suggestion-item';
+      button.dataset.question = question;
+      const icon = textElement('span', 'suggestion-icon', '↳');
+      icon.setAttribute('aria-hidden', 'true');
+      button.append(icon, textElement('span', 'suggestion-text', question));
+      list.append(button);
+    });
+    const hiddenCount = questions.length - visible.length;
+    if (hiddenCount > 0 || (suggestionState.expanded && questions.length > SUGGESTION_VISIBLE)) {
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'suggestion-chip suggestion-toggle';
+      toggle.textContent = hiddenCount > 0 ? `+ ${hiddenCount} more` : 'Show less';
+      toggle.addEventListener('click', () => {
+        suggestionState.expanded = !suggestionState.expanded;
+        renderSuggestions();
+      });
+      list.append(toggle);
+    }
+    if (actions) actions.hidden = false;
+  }
+
+  async function fetchSuggestions(paper) {
+    return api(`/api/papers/${encodeURIComponent(paper.id)}/suggestions`, { timeoutMs: 180000 });
+  }
+
+  function suggestionList(payload) {
+    return (payload.questions || []).filter((item) => String(item || '').trim());
+  }
+
+  async function loadSuggestions(paper) {
+    suggestionState.token += 1;
+    const requestId = suggestionState.token;
+    suggestionState.expanded = false;
+    if (!paper) {
+      suggestionState.paperId = null;
+      suggestionState.questions = [];
+      suggestionState.loading = false;
+      renderSuggestions();
+      return;
+    }
+    suggestionState.paperId = paper.id;
+    suggestionState.questions = [];
+    suggestionState.loading = true;
+    renderSuggestions();
+
+    let payload;
+    try {
+      payload = await fetchSuggestions(paper);
+    } catch (error) {
+      if (requestId === suggestionState.token) {
+        suggestionState.loading = false;
+        renderSuggestions();
+      }
+      return;
+    }
+    if (requestId !== suggestionState.token) return;
+    suggestionState.questions = suggestionList(payload);
+    suggestionState.loading = false;
+    renderSuggestions();
+
+    // The text-derived list shows up instantly; the model keeps working in the
+    // background and quietly replaces it with sharper questions when ready.
+    let attempts = 0;
+    while (!payload.ready && attempts < 16 && requestId === suggestionState.token) {
+      attempts += 1;
+      await new Promise((resolve) => window.setTimeout(resolve, 2500));
+      if (requestId !== suggestionState.token) return;
+      try {
+        payload = await fetchSuggestions(paper);
+      } catch (error) {
+        return;
+      }
+      if (requestId !== suggestionState.token) return;
+      const fresh = suggestionList(payload);
+      if (fresh.length && fresh.join('|') !== suggestionState.questions.join('|')) {
+        suggestionState.questions = fresh;
+        renderSuggestions();
+      }
+    }
+  }
+
+  function dropSuggestion(question) {
+    const key = normaliseQuestion(question);
+    const before = suggestionState.questions.length;
+    suggestionState.questions = suggestionState.questions.filter((item) => normaliseQuestion(item) !== key);
+    if (suggestionState.questions.length !== before) renderSuggestions();
+  }
+
+  async function sendQuestion(question) {
+    const cleanQuestion = String(question || '').trim();
+    if (!cleanQuestion || !activePaper) return;
+    const epoch = chatEpoch;
+    addMessage('user', cleanQuestion);
+    chatInput.value = '';
+    sendButton.disabled = true;
+    document.querySelectorAll('.suggestion-chip[data-question]').forEach((button) => { button.disabled = true; });
+    showTyping();
+    try {
+      const payload = await api(`/api/papers/${encodeURIComponent(activePaper.id)}/ask`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: cleanQuestion, detail: answerDetail() }),
+        timeoutMs: 300000,
+      });
+      $('#typingIndicator')?.remove();
+      if (epoch !== chatEpoch) return; // chat was cleared while the answer was loading
+      addMessage('assistant', payload.answer || 'No answer was returned.', payload.sources || [], payload.mode || '');
+      dropSuggestion(cleanQuestion);
+    } catch (error) {
+      $('#typingIndicator')?.remove();
+      if (epoch !== chatEpoch) return;
+      addMessage('assistant', `I couldn't complete that request: ${error.message}`);
+    } finally {
+      sendButton.disabled = !activePaper;
+      document.querySelectorAll('.suggestion-chip').forEach((button) => { button.disabled = !activePaper; });
+      chatInput.focus();
+    }
+  }
+
+  async function deleteActivePaper() {
+    if (!activePaper) return;
+    const paperToDelete = activePaper;
+    try {
+      await api(`/api/papers/${encodeURIComponent(paperToDelete.id)}`, { method: 'DELETE' });
+      activePaper = null;
+      setPaperSectionsEnabled(false);
+      setActiveSection('upload');
+      resultsPanel.hidden = true;
+      emptyState.hidden = false;
+      chatMessages.replaceChildren();
+      chatMessages.append(assistantWelcome);
+      chatInput.disabled = true;
+      sendButton.disabled = true;
+      updateChatContext(null);
+      loadSuggestions(null);
+      $('#footerStatus').textContent = 'Ready when you are';
+      await refreshModelChip();
+      await loadLibrary();
+      showToast('Paper removed from this session.');
+      $('#dropZone').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+
+  browseButton.addEventListener('click', () => pdfInput.click());
+
+  // Clear the chat conversation (keeps the paper + its brief, only wipes messages).
+  const clearChatButton = $('#clearChatButton');
+  if (clearChatButton) {
+    clearChatButton.addEventListener('click', () => {
+      chatEpoch += 1;
+      $('#typingIndicator')?.remove();
+      chatMessages.replaceChildren();
+      chatLog = [];
+      if (activePaper) {
+        try { localStorage.removeItem(`dqChat:${activePaper.id}`); } catch (error) { /* ignore */ }
+      }
+      if (assistantWelcome) chatMessages.append(assistantWelcome);
+      document.querySelectorAll('.suggestion-chip[data-question]').forEach((button) => {
+        button.disabled = !activePaper;
+      });
+      sendButton.disabled = !activePaper;
+      showToast(activePaper ? 'Chat history cleared.' : 'Chat is already empty.');
+    });
+  }
+  pdfInput.addEventListener('change', (event) => uploadFile(event.target.files[0]));
+  dropZone.addEventListener('dragover', (event) => { event.preventDefault(); dropZone.classList.add('is-dragging'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('is-dragging'));
+  dropZone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dropZone.classList.remove('is-dragging');
+    uploadFile(event.dataTransfer.files[0]);
+  });
+  chatForm.addEventListener('submit', (event) => { event.preventDefault(); sendQuestion(chatInput.value); });
+  if (window.DQAuth && window.DQAuth.bindForm) {
+    window.DQAuth.bindForm('#chatForm', '#sendButton', ['#chatInput']);
+  }
+  const modelChip = $('#modelChip');
+  if (modelChip) {
+    modelChip.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const menu = $('#modelMenu');
+      if (!menu) return;
+      const open = menu.hidden;
+      menu.hidden = !open;
+      modelChip.setAttribute('aria-expanded', String(open));
+    });
+    document.addEventListener('click', (event) => {
+      const menu = $('#modelMenu');
+      if (!menu || menu.hidden) return;
+      if (!menu.contains(event.target) && event.target !== modelChip) {
+        menu.hidden = true;
+        modelChip.setAttribute('aria-expanded', 'false');
+      }
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        const menu = $('#modelMenu');
+        if (menu && !menu.hidden) {
+          menu.hidden = true;
+          modelChip.setAttribute('aria-expanded', 'false');
+        }
+      }
+    });
+  }
+
+  const suggestionArea = $('#suggestionArea');
+  if (suggestionArea) {
+    suggestionArea.addEventListener('click', (event) => {
+      const button = event.target.closest('.suggestion-chip');
+      if (!button || button.disabled) return;
+      const question = button.dataset.question;
+      if (question) sendQuestion(question);
+    });
+    suggestionArea.querySelectorAll('.suggestion-chip[data-question]').forEach((button) => { button.disabled = true; });
+  }
+  $('#deletePaperButton').addEventListener('click', deleteActivePaper);
+  const logoutButton = $('#logoutButton');
+  if (logoutButton) {
+    logoutButton.addEventListener('click', async () => {
+      try { await api('/api/logout', { method: 'POST' }); } catch { /* ignore */ }
+      if (window.DQAuth) window.DQAuth.clearToken();
+      window.location.href = '/';
+    });
+  }
+  sectionLinks.forEach((link) => {
+    link.addEventListener('click', (event) => {
+      if (link.getAttribute('aria-disabled') === 'true') {
+        event.preventDefault();
+        setActiveSection('upload');
+        setAlert('Upload a PDF or open one from your Paper Library to use this section.');
+        dropZone.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return;
+      }
+      setActiveSection(link.dataset.section);
+      if (link.dataset.section === 'upload') setAlert('');
+    });
+  });
+
+  /* ---- model chip: show which local model is answering, and switch it ---- */
+
+  function shortModelName(label) {
+    let text = String(label || 'Local model').trim();
+    // A label may arrive as a full path (LM Studio folders, downloaded files).
+    const segments = text.split(/[\\/]+/).filter(Boolean);
+    if (segments.length > 1) text = segments[segments.length - 1];
+    text = text.replace(/\.gguf$/i, '').replace(/\(not loaded\)/i, '').trim();
+    const qwen = text.match(/qwen2\.5[-_ ]?([0-9.]+b)/i);
+    if (qwen) return `Qwen2.5 ${qwen[1].toUpperCase()}`;
+    text = text.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+    return (text || 'Local model').slice(0, 26);
+  }
+
+  function renderModelMenu(payload) {
+    const menu = $('#modelMenu');
+    if (!menu) return;
+    menu.replaceChildren();
+    const options = payload.options || [];
+    const presets = options.filter((option) => option.kind === 'preset');
+    const files = options.filter((option) => option.kind !== 'preset');
+    const addGroup = (title, items) => {
+      if (!items.length) return;
+      menu.append(textElement('div', 'model-menu-title', title));
+      items.forEach((option) => {
+        const isCurrent = option.id === payload.selected_id;
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'model-menu-item' + (isCurrent ? ' is-current' : '');
+        item.dataset.modelId = option.id;
+        item.setAttribute('role', 'option');
+        item.setAttribute('aria-selected', String(Boolean(isCurrent)));
+        const top = document.createElement('span');
+        top.className = 'model-menu-name';
+        top.textContent = option.label || option.id;
+        const meta = document.createElement('span');
+        meta.className = 'model-menu-meta';
+        const bits = [];
+        if (option.size_mb) bits.push(`${option.size_mb} MB`);
+        if (option.source && option.kind !== 'preset') bits.push(option.source);
+        const needsDownload = option.kind === 'preset' && !option.downloaded;
+        if (option.kind === 'preset') bits.push(option.downloaded ? 'downloaded' : 'click to download');
+        if (isCurrent) bits.push('in use');
+        meta.textContent = bits.join(' · ');
+        item.append(top, meta);
+        if (needsDownload) item.dataset.downloadPreset = option.id;
+        item.addEventListener('click', () => {
+          if (needsDownload) startPresetDownload(option, item, meta);
+          else selectModel(option, item);
+        });
+        menu.append(item);
+      });
+    };
+    addGroup('Recommended presets', presets);
+    addGroup('GGUF files on this laptop', files);
+    const foot = document.createElement('a');
+    foot.className = 'model-menu-foot';
+    foot.href = '/profile';
+    foot.textContent = 'Add or download more models →';
+    menu.append(foot);
+  }
+
+  let downloadTimer = null;
+
+  function stopDownloadPolling() {
+    if (downloadTimer) {
+      window.clearInterval(downloadTimer);
+      downloadTimer = null;
+    }
+  }
+
+  async function pollDownload(option, item, meta) {
+    try {
+      const status = await api('/api/models/download');
+      const percent = status.percent;
+      const chipSub = $('#modelChipSub');
+      if (status.state === 'downloading') {
+        const progress = percent === null || percent === undefined
+          ? `${status.received_mb} MB`
+          : `${percent}%`;
+        if (meta) meta.textContent = `${option.label || option.id} · downloading ${progress}`;
+        if (chipSub) chipSub.textContent = `downloading ${progress}`;
+        return;
+      }
+      stopDownloadPolling();
+      if (status.state === 'done') {
+        showToast(`${option.label || option.id} downloaded. It is now the selected model.`);
+        if (item) item.disabled = false;
+        await refreshModelChip();
+      } else if (status.state === 'error') {
+        showToast(status.error || 'Download failed. Check your internet connection.');
+        if (meta) meta.textContent = 'download failed · click to retry';
+        if (item) item.disabled = false;
+        const chipSub = $('#modelChipSub');
+        if (chipSub) chipSub.textContent = 'no model yet · Profile';
+      } else {
+        // Nothing in flight any more (server restarted, or the file is already here).
+        stopDownloadPolling();
+        await refreshModelChip();
+      }
+    } catch (error) {
+      stopDownloadPolling();
+      if (item) item.disabled = false;
+      showToast(error.message);
+    }
+  }
+
+  async function startPresetDownload(option, item, meta) {
+    item.disabled = true;
+    if (meta) meta.textContent = 'starting download…';
+    try {
+      const started = await api('/api/models/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: option.id }),
+      });
+      if (started.status && started.status.state === 'downloading') {
+        showToast('Downloading the model — this needs internet only this once.');
+      }
+      stopDownloadPolling();
+      downloadTimer = window.setInterval(() => pollDownload(option, item, meta), 1500);
+      pollDownload(option, item, meta);
+    } catch (error) {
+      showToast(error.message);
+      item.disabled = false;
+      if (meta) meta.textContent = 'click to download';
+    }
+  }
+
+  async function selectModel(option, item) {
+    const menu = $('#modelMenu');
+    item.disabled = true;
+    try {
+      const result = await api('/api/models/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: option.id }),
+      });
+      $('#modelChipLabel').textContent = shortModelName(option.label || option.id);
+      showToast(result.message || 'Model saved.');
+      if (result.managed) {
+        window.setTimeout(refreshModelChip, 6000);
+      }
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      item.disabled = false;
+      if (menu) menu.hidden = true;
+      const chip = $('#modelChip');
+      if (chip) chip.setAttribute('aria-expanded', 'false');
+    }
+  }
+
+  let modelPayload = null;
+
+  async function refreshModelChip() {
+    try {
+      const payload = await api('/api/models');
+      modelPayload = payload;
+      const options = payload.options || [];
+      const current = options.find((option) => option.id === payload.selected_id);
+      const label = (current && current.label) || (payload.current && payload.current.model) || 'Local model';
+      const running = Boolean(payload.current && payload.current.available);
+      const chipLabel = $('#modelChipLabel');
+      const chipSub = $('#modelChipSub');
+      const dot = $('#modelChipDot');
+      if (chipLabel) chipLabel.textContent = shortModelName(label);
+      if (chipSub) {
+        chipSub.textContent = running ? 'running · offline' : 'no model yet · Profile';
+      }
+      if (dot) dot.dataset.state = running ? 'on' : 'off';
+      const chip = $('#modelChip');
+      if (chip) chip.title = running
+        ? `${label} is answering your questions`
+        : `${label} is not loaded yet — open Profile → AI model to download or switch`;
+      renderModelMenu(payload);
+    } catch (error) {
+      const chipLabel = $('#modelChipLabel');
+      if (chipLabel) chipLabel.textContent = 'Model unavailable';
+    }
+  }
+
+  async function initialize() {
+    setPaperSectionsEnabled(false);
+    try {
+      const health = await api('/api/health');
+      maxUploadMb = Number(health.max_upload_mb) || 20;
+      $('#connectionPill').dataset.mode = 'local';
+      $('#connectionLabel').textContent = 'Local SQLite';
+      $('#footerStatus').textContent = health.llm_available
+        ? `${health.llm_label || 'Local model'} ready · ${health.llm_model || 'default model'}`
+        : 'Preview mode · no local model is running';
+      await refreshModelChip();
+      const notice = $('#modelNotice');
+      const noticeText = $('#modelNoticeText');
+      if (notice && noticeText && !health.llm_available) {
+        const missing = [];
+        if (health.ocr_available === false) missing.push('OCR add-on');
+        if (health.tables_available === false) missing.push('table reader');
+        const ready = Boolean(modelPayload)
+          && (modelPayload.options || []).some((option) => option.downloaded);
+        noticeText.innerHTML = ready
+          ? '<strong>The model is starting.</strong> Answers are exact PDF quotes for a few seconds.'
+          : '<strong>No model downloaded yet.</strong> Answers are exact quotes from your PDF. '
+            + 'Open <a href="/profile">Profile → AI model</a> and click a model to download it — '
+            + 'it starts answering on its own once the download finishes.'
+            + (missing.length ? ` Optional extras not installed: ${missing.join(', ')}.` : '');
+        notice.hidden = false;
+      } else if (notice) {
+        notice.hidden = true;
+      }
+      try {
+        const download = await api('/api/models/download');
+        if (download.state === 'downloading' && download.id) {
+          // A download was already running (e.g. the tab was reloaded): keep watching it.
+          const option = { id: download.id, label: download.label || 'model' };
+          stopDownloadPolling();
+          downloadTimer = window.setInterval(() => pollDownload(option, null, null), 2000);
+        }
+      } catch (error) { /* status is optional */ }
+      await loadLibrary();
+    } catch (error) {
+      $('#connectionPill').dataset.mode = 'offline';
+      $('#connectionLabel').textContent = 'Server unavailable';
+      setAlert(error.message);
+    }
+  }
+
+  restoreAnswerDetail();
+  initialize();
+})();

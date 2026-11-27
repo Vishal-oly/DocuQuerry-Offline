@@ -1,0 +1,17 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+instance/
+.DS_Store
+runtime/
+models/
+logs/
+
+# Local browser-harness scratch space (jsdom smoke runs)
+.uitest/
+
+# Build artifact (shared as a ZIP, not tracked)
+DocuQuery-Offline.zip
